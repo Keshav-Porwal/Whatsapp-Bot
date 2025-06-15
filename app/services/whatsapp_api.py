@@ -4,7 +4,7 @@ from app.config import settings
 # Twilio credentials (account SID and auth token)
 TWILIO_ACCOUNT_SID = settings.TWILIO_ACCOUNT_SID
 TWILIO_AUTH_TOKEN = settings.TWILIO_AUTH_TOKEN
-TWILIO_WHATSAPP_NUMBER = settings.TWILIO_WHATSAPP_NUMBER
+TWILIO_PHONE_NUMBER = settings.TWILIO_PHONE_NUMBER
 
 # Twilio client setup
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -25,7 +25,7 @@ def send_whatsapp_message(to: str, message: str):
 
     client.messages.create(
         body=message,
-        from_=f"whatsapp:{TWILIO_WHATSAPP_NUMBER}",
+        from_=f"whatsapp:{TWILIO_PHONE_NUMBER}",
         to=formatted_to
     )
 

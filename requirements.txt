@@ -1,7 +1,9 @@
 fastapi
 uvicorn
-python-multipart
-pydantic
-requests
-pymongo
+openai
 python-dotenv
+requests
+pydantic
+pillow
+pymongo
+twilio
