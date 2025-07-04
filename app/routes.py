@@ -1,24 +1,25 @@
 from fastapi import APIRouter, Request, Form, HTTPException
-from app.services.mongo_db import update_user_context, get_user_context
-from app.services.gemini_api import (
+from app.services.mongo_db import save_user, save_message
+from app.services.gemini_api import (  # Updated import
     chat_with_gpt, 
     analyze_crop_image, 
     get_treatment_followup,
-    context_manager
+    extract_crop_type_from_ai_response,
+    get_user_session_info,
+    clear_user_conversation,
+    get_active_sessions_count,
+    get_all_sessions_info
 )
 from app.services.whatsapp_api import send_whatsapp_message
-from app.services.mongo_db import save_user, save_message
-from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
-import requests
+from app.models import TextChatRequest, ImageRequest, TreatmentRequest
+from app.utils.helper import extract_phone_number, format_whatsapp_message, download_twilio_media
+from app.config import settings
 import base64
 import os
-import re
-from typing import Optional
 
 # Environment variables with validation
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "AC7a11efa7925fea0a4030c86cf2098811")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "0e1b19cb689baa4fe98452398d31dc96")
+TWILIO_ACCOUNT_SID = settings.TWILIO_ACCOUNT_SID
+TWILIO_AUTH_TOKEN = settings.TWILIO_AUTH_TOKEN
 
 # Debug credentials on startup
 print(f"[STARTUP] Twilio credentials check:")
@@ -32,353 +33,234 @@ if TWILIO_AUTH_TOKEN:
 # Create router
 router = APIRouter()
 
-# Enhanced Pydantic models
-class TextChatRequest(BaseModel):
-    user_id: str
-    message: str
-    user_name: str = ""
-    location: Optional[str] = None
-    crop_type: Optional[str] = None
-
-class ImageRequest(BaseModel):
-    user_id: str
-    base64_image: str
-    user_name: str = ""
-    location: Optional[str] = None
-    additional_info: Optional[str] = ""
-
-class TreatmentRequest(BaseModel):
-    user_id: str
-    disease: str
-    crop: str
-
-# Helper functions
-def extract_phone_number(from_field: str) -> str:
-    """Extract clean phone number from WhatsApp format"""
-    # Remove 'whatsapp:' prefix if present
-    phone = from_field.replace('whatsapp:', '').strip()
-    return phone
-
-def is_hindi_english_mixed(text: str) -> bool:
-    """Check if text contains Hindi characters"""
-    hindi_pattern = re.compile(r'[\u0900-\u097F]')
-    return bool(hindi_pattern.search(text))
-
-def format_whatsapp_message(message: str, max_length: int = 1500) -> list:
-    """Smart message formatting for WhatsApp with Twilio limits"""
-    # Twilio's actual limit is 1600 characters, but we use 1500 for safety
-    if len(message) <= max_length:
-        return [message]
-    
-    chunks = []
-    
-    # First try to split by double newlines (paragraphs/sections)
-    sections = message.split('\n\n')
-    current_chunk = ""
-    
-    for section in sections:
-        # If adding this section exceeds limit
-        if len(current_chunk + '\n\n' + section) > max_length:
-            # Save current chunk if it has content
-            if current_chunk.strip():
-                chunks.append(current_chunk.strip())
-            
-            # If section itself is too long, split it further
-            if len(section) > max_length:
-                # Split by single newlines
-                lines = section.split('\n')
-                temp_chunk = ""
-                for line in lines:
-                    if len(temp_chunk + '\n' + line) > max_length:
-                        if temp_chunk.strip():
-                            chunks.append(temp_chunk.strip())
-                        temp_chunk = line
-                    else:
-                        temp_chunk += '\n' + line if temp_chunk else line
-                
-                if temp_chunk.strip():
-                    current_chunk = temp_chunk
-                else:
-                    current_chunk = ""
-            else:
-                current_chunk = section
-        else:
-            current_chunk += '\n\n' + section if current_chunk else section
-    
-    # Add any remaining content
-    if current_chunk.strip():
-        chunks.append(current_chunk.strip())
-    
-    # Final check - if any chunk is still too long, split by sentences
-    final_chunks = []
-    for chunk in chunks:
-        if len(chunk) <= max_length:
-            final_chunks.append(chunk)
-        else:
-            # Split by sentences (. or ! or ?)
-            sentences = []
-            temp_sentences = chunk.replace('!', '.').replace('?', '.').split('.')
-            for sent in temp_sentences:
-                if sent.strip():
-                    sentences.append(sent.strip() + '.')
-            
-            temp_chunk = ""
-            for sentence in sentences:
-                if len(temp_chunk + ' ' + sentence) > max_length:
-                    if temp_chunk.strip():
-                        final_chunks.append(temp_chunk.strip())
-                    temp_chunk = sentence
-                else:
-                    temp_chunk += ' ' + sentence if temp_chunk else sentence
-            
-            if temp_chunk.strip():
-                final_chunks.append(temp_chunk.strip())
-    
-    return final_chunks if final_chunks else [message[:max_length]]
-
-def download_twilio_media(media_url: str) -> bytes:
-    """Download media from Twilio with proper authentication"""
-    try:
-        # Debug: Check if credentials are loaded
-        if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
-            raise ValueError(f"Missing credentials: SID={'Present' if TWILIO_ACCOUNT_SID else 'Missing'}, Token={'Present' if TWILIO_AUTH_TOKEN else 'Missing'}")
-        
-        print(f"[DEBUG] Using Account SID: {TWILIO_ACCOUNT_SID[:8]}...")
-        print(f"[DEBUG] Token length: {len(TWILIO_AUTH_TOKEN) if TWILIO_AUTH_TOKEN else 0}")
-        print(f"[DEBUG] Media URL: {media_url}")
-        
-        # Validate that SID starts with 'AC' (Twilio Account SID format)
-        if not TWILIO_ACCOUNT_SID.startswith('AC'):
-            raise ValueError(f"Invalid Account SID format. Should start with 'AC', got: {TWILIO_ACCOUNT_SID[:5]}...")
-        
-        # Method 1: Basic authentication with requests.auth
-        response = requests.get(
-            media_url,
-            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-            timeout=30,
-            headers={
-                'User-Agent': 'TwilioMediaDownloader/1.0',
-                'Accept': 'image/*'
-            }
-        )
-        
-        print(f"[DEBUG] Response status: {response.status_code}")
-        
-        if response.status_code == 200:
-            print(f"[DEBUG] Successfully downloaded {len(response.content)} bytes")
-            return response.content
-        
-        # If 401, the credentials are definitely wrong
-        if response.status_code == 401:
-            print(f"[DEBUG] Authentication failed. Response: {response.text[:500]}")
-            raise ValueError(f"Twilio authentication failed. Check your ACCOUNT_SID and AUTH_TOKEN. SID: {TWILIO_ACCOUNT_SID[:8]}...")
-            
-        # For other status codes, try alternative method
-        print(f"[DEBUG] First method failed with status {response.status_code}, trying alternative...")
-        
-        # Method 2: Manual Authorization header
-        import base64
-        credentials = base64.b64encode(f"{TWILIO_ACCOUNT_SID}:{TWILIO_AUTH_TOKEN}".encode()).decode()
-        
-        response = requests.get(
-            media_url,
-            headers={
-                'Authorization': f'Basic {credentials}',
-                'User-Agent': 'TwilioMediaDownloader/1.0',
-                'Accept': 'image/*'
-            },
-            timeout=30
-        )
-        
-        print(f"[DEBUG] Alternative method status: {response.status_code}")
-        
-        if response.status_code == 200:
-            return response.content
-            
-        # If still failing, provide detailed error
-        raise ValueError(f"Failed to download image. Status: {response.status_code}, Response: {response.text[:300]}")
-        
-    except requests.exceptions.Timeout:
-        raise ValueError("Image download timed out after 30 seconds")
-    except requests.exceptions.ConnectionError as e:
-        raise ValueError(f"Connection error while downloading image: {str(e)}")
-    except ValueError:
-        # Re-raise ValueError as-is
-        raise
-    except Exception as e:
-        raise ValueError(f"Unexpected error during image download: {str(e)}")
-
-# ---------------------------- ENHANCED TEXT CHAT ENDPOINT ----------------------------
+# ---------------------------- ENHANCED TEXT CHAT ENDPOINT WITH SESSION MANAGEMENT ----------------------------
 
 @router.post("/chat")
 async def handle_text_chat(req: TextChatRequest):
-    """Enhanced text chat with context awareness"""
+    """Enhanced text chat with session management and proper message saving"""
     try:
         # Validate input
         if not req.user_id or not req.message:
             raise HTTPException(status_code=400, detail="user_id and message are required")
 
-        # Update user context with additional information
-        if req.location:
-            update_user_context(req.user_id, {"location": req.location})
-        if req.crop_type:
-            update_user_context(req.user_id, {"crop_type": req.crop_type})
+        # Save user (only once, prevents duplicates)
+        save_user(req.user_id, "", req.user_name or "")
 
-        # Save user and message
-        save_user(req.user_id, req.user_name)
-        save_message(req.user_id, req.message, is_bot=False)
+        # Get AI response with crop type (this now includes session management)
+        reply, crop_type = await chat_with_gpt(req.message, req.user_id)
 
-        # Get intelligent response
-        reply = chat_with_gpt(req.message, req.user_id)
+        # Save user message to database
+        user_crop_type = extract_crop_type_from_ai_response(req.message) if not crop_type else crop_type
+        save_message(
+            user_id=req.user_id,
+            message=req.message,
+            is_bot=False,
+            crop_type=user_crop_type
+        )
 
-        # Save bot reply
-        save_message(req.user_id, reply, is_bot=True)
+        # Save bot reply to database
+        save_message(
+            user_id=req.user_id,
+            message=reply,
+            is_bot=True,
+            crop_type=crop_type
+        )
 
-        # Get user context for additional info
-        user_context = get_user_context(req.user_id)
+        # Get session info
+        session_info = get_user_session_info(req.user_id)
 
         return {
             "user_id": req.user_id,
             "reply": reply,
-            "context": {
-                "crop_type": user_context.get('crop_type'),
-                "location": user_context.get('location'),
-                "last_diseases": user_context.get('identified_diseases', [])[-3:]  # Last 3 diseases
+            "crop_type": crop_type if crop_type else "Not identified",
+            "session_info": {
+                "message_count": session_info.get("message_count", 0) if session_info else 0,
+                "time_remaining": session_info.get("time_remaining", 0) if session_info else 0
             }
         }
 
     except Exception as e:
+        error_reply = f"⚠️ Kuch problem hui hai. Phir se try kariye. (Error: {str(e)})"
+        # Save error message too
+        save_message(
+            user_id=req.user_id,
+            message=error_reply,
+            is_bot=True,
+            crop_type=""
+        )
         return {
             "user_id": req.user_id,
-            "reply": f"⚠️ Kuch problem hui hai. Phir se try kariye. (Error: {str(e)})",
+            "reply": error_reply,
             "error": True
         }
 
-# ---------------------------- ENHANCED IMAGE UPLOAD ENDPOINT ----------------------------
+# ---------------------------- ENHANCED IMAGE UPLOAD ENDPOINT WITH SESSION MANAGEMENT ----------------------------
 
 @router.post("/upload-image")
 async def handle_image_upload(payload: ImageRequest):
-    """Enhanced image analysis with context"""
+    """Enhanced image analysis with session management and proper message saving"""
     try:
         # Validate input
         if not payload.user_id or not payload.base64_image:
             raise HTTPException(status_code=400, detail="user_id and base64_image are required")
 
-        # Update context
-        if payload.location:
-            update_user_context(payload.user_id, {"location": payload.location})
+        # Save user (only once)
+        save_user(payload.user_id, "", payload.user_name or "")
 
-        # Save user and upload event
-        save_user(payload.user_id, payload.user_name)
-        
-        # Create descriptive message for database
-        upload_msg = "[Image Uploaded]"
-        if payload.additional_info:
-            upload_msg += f" - {payload.additional_info}"
-        
-        save_message(payload.user_id, upload_msg, is_bot=False)
-
-        # Enhanced image analysis
-        diagnosis = analyze_crop_image(
+        # Enhanced image analysis with session management
+        diagnosis, crop_type = await analyze_crop_image(
             payload.base64_image, 
-            payload.user_id
+            payload.user_id  # Now includes session management
         )
 
-        # Save diagnosis
-        save_message(payload.user_id, diagnosis, is_bot=True)
+        # Save image upload to database (store base64 instead of message)
+        save_message(
+            user_id=payload.user_id,
+            message="",  # Empty message for image
+            image_base64=payload.base64_image,
+            is_bot=False,
+            crop_type=crop_type
+        )
 
-        # Get updated context
-        user_context = get_user_context(payload.user_id)
+        # Save diagnosis to database
+        save_message(
+            user_id=payload.user_id,
+            message=diagnosis,
+            is_bot=True,
+            crop_type=crop_type
+        )
+
+        # Get session info
+        session_info = get_user_session_info(payload.user_id)
 
         return {
             "user_id": payload.user_id,
             "diagnosis": diagnosis,
-            "context": {
-                "crop_type": user_context.get('crop_type'),
-                "confidence": "Check diagnosis for confidence level",
-                "follow_up_available": True
+            "crop_type": crop_type if crop_type else "Not identified",
+            "session_info": {
+                "message_count": session_info.get("message_count", 0) if session_info else 0,
+                "time_remaining": session_info.get("time_remaining", 0) if session_info else 0
             }
         }
 
     except Exception as e:
         error_msg = f"⚠️ Image analysis mein problem: {str(e)}"
-        save_message(payload.user_id, error_msg, is_bot=True)
+        save_message(
+            user_id=payload.user_id,
+            message=error_msg,
+            is_bot=True,
+            crop_type=""
+        )
         return {
             "user_id": payload.user_id,
             "diagnosis": error_msg,
             "error": True
         }
 
-# ---------------------------- TREATMENT FOLLOW-UP ENDPOINT ----------------------------
+# ---------------------------- TREATMENT FOLLOW-UP ENDPOINT WITH SESSION MANAGEMENT ----------------------------
 
 @router.post("/treatment-details")
 async def get_treatment_details(req: TreatmentRequest):
-    """Get detailed treatment information for diagnosed diseases"""
+    """Get detailed treatment information with session context"""
     try:
-        # Get detailed treatment guidance
+        # Get detailed treatment guidance with session context
         treatment_details = get_treatment_followup(req.disease, req.crop, req.user_id)
         
-        # Save interaction
-        save_message(req.user_id, f"Treatment request: {req.disease} in {req.crop}", is_bot=False)
-        save_message(req.user_id, treatment_details, is_bot=True)
+        # Save interaction to database
+        save_message(
+            user_id=req.user_id,
+            message=f"Treatment request: {req.disease} in {req.crop}",
+            is_bot=False,
+            crop_type=req.crop
+        )
+        save_message(
+            user_id=req.user_id,
+            message=treatment_details,
+            is_bot=True,
+            crop_type=req.crop
+        )
+        
+        # Get session info
+        session_info = get_user_session_info(req.user_id)
         
         return {
             "user_id": req.user_id,
             "disease": req.disease,
             "crop": req.crop,
-            "treatment_details": treatment_details
+            "treatment_details": treatment_details,
+            "session_info": {
+                "message_count": session_info.get("message_count", 0) if session_info else 0,
+                "time_remaining": session_info.get("time_remaining", 0) if session_info else 0
+            }
         }
         
     except Exception as e:
+        error_msg = f"Treatment info mein problem: {str(e)}"
+        save_message(
+            user_id=req.user_id,
+            message=error_msg,
+            is_bot=True,
+            crop_type=req.crop
+        )
         return {
             "user_id": req.user_id,
-            "error": f"Treatment info mein problem: {str(e)}"
+            "error": error_msg
         }
 
-# ---------------------------- ENHANCED WHATSAPP WEBHOOK ----------------------------
+# ---------------------------- ENHANCED WHATSAPP WEBHOOK WITH SESSION MANAGEMENT ----------------------------
 
 @router.post("/webhook")
 async def webhook(req: Request):
-    """Enhanced WhatsApp webhook with intelligent conversation handling"""
+    """Enhanced WhatsApp webhook with session management and proper message saving"""
     try:
         # Parse form data
         form = await req.form()
         
         # Extract information
-        message = form.get("Body", "").strip()
-        phone_number = extract_phone_number(form.get("From", ""))
+        body_field = form.get("Body", "")
+        if isinstance(body_field, str):
+            message = body_field.strip()
+        else:
+            message = ""
+        from_field = form.get("From", "")
+        if not isinstance(from_field, str):
+            from_field = str(from_field)
+        phone_number = extract_phone_number(from_field)
         media_url = form.get("MediaUrl0")
         
         if not phone_number:
             return {"status": "error", "message": "No phone number provided"}
 
-        # Initialize/update user context
+        # Use phone number as user_id for WhatsApp users
+        user_id = phone_number
         
-        
-        # ---------------- TEXT MESSAGE HANDLING ----------------
+        # ---------------- TEXT MESSAGE HANDLING WITH SESSION MANAGEMENT ----------------
         if message and not media_url:
-            # Save incoming message
-            save_user(phone_number, "")
-            save_message(phone_number, message, is_bot=False)
+            # Save user with phone number
+            save_user(user_id, phone_number, "")
 
-            # Check if this is location/context information
-            if any(keyword in message.lower() for keyword in ['location', 'state', 'district', 'village']):
-                update_user_context(phone_number, {"location": message})
-                response_prefix = "📍 Location save ho gaya. "
-            else:
-                response_prefix = ""
+            # Get AI response with crop type (includes session management)
+            reply, crop_type = await chat_with_gpt(message, user_id)
 
-            # Get AI response with context
-            context = await get_user_context(phone_number)
-            reply = chat_with_gpt(message, phone_number)
-            print(f"[DEBUG] Context before reply: {context}")
-            full_reply = response_prefix + reply
+            # Save user message to database
+            save_message(
+                user_id=user_id,
+                message=message,
+                is_bot=False,
+                crop_type=crop_type
+            )
 
             # Format and send response in properly sized chunks
-            message_chunks = format_whatsapp_message(full_reply, max_length=1500)
+            message_chunks = format_whatsapp_message(reply, max_length=1500)
             
             for i, chunk in enumerate(message_chunks):
-                save_message(phone_number, chunk, is_bot=True)
+                # Save each bot reply chunk to database
+                save_message(
+                    user_id=user_id,
+                    message=chunk,
+                    is_bot=True,
+                    crop_type=crop_type
+                )
                 
                 # Add message number indicator for multi-part messages
                 if len(message_chunks) > 1:
@@ -388,26 +270,37 @@ async def webhook(req: Request):
                     
                 send_whatsapp_message(phone_number, chunk_indicator)
 
-        # ---------------- IMAGE MESSAGE HANDLING ----------------
+            # Send session info to user if it's a long conversation
+            session_info = get_user_session_info(user_id)
+            if session_info and session_info.get("message_count", 0) > 20:
+                session_msg = f"💬 Session: {session_info.get('message_count', 0)} messages, {session_info.get('time_remaining', 0)//60:.0f} min remaining"
+                send_whatsapp_message(phone_number, session_msg)
+
+        # ---------------- IMAGE MESSAGE HANDLING WITH SESSION MANAGEMENT ----------------
         elif media_url:
             try:
-                # Save image upload event first
-                image_msg = "[Fasal ki photo mili / Crop Image Received]"
-                if message:  # If there's accompanying text
-                    image_msg += f" - {message}"
-                    
-                save_user(phone_number, "")
-                save_message(phone_number, image_msg, is_bot=False)
+                # Save user with phone number
+                save_user(user_id, phone_number, "")
 
                 # Send acknowledgment
-                send_whatsapp_message(
-                    phone_number, 
-                    "📸 Photo mil gayi! Analysis ho raha hai...\n(Image received! Analyzing...)"
+                ack_message = "📸 Photo mil gayi! Analysis ho raha hai...\n(Image received! Analyzing...)"
+                send_whatsapp_message(phone_number, ack_message)
+                
+                # Save acknowledgment message to database
+                save_message(
+                    user_id=user_id,
+                    message=ack_message,
+                    is_bot=True,
+                    crop_type=""
                 )
 
                 # Download image with improved authentication
                 try:
-                    image_content = download_twilio_media(media_url)
+                    if not isinstance(media_url, str):
+                        media_url_str = str(media_url)
+                    else:
+                        media_url_str = media_url
+                    image_content = download_twilio_media(media_url_str)
                     print(f"Successfully downloaded image for {phone_number}, size: {len(image_content)} bytes")
                 except Exception as download_error:
                     print(f"Image download error for {phone_number}: {str(download_error)}")
@@ -417,14 +310,29 @@ async def webhook(req: Request):
                 image_base64 = base64.b64encode(image_content).decode('utf-8')
                 print(f"Image converted to base64 for {phone_number}, length: {len(image_base64)}")
 
-                # Analyze image with context
-                diagnosis = analyze_crop_image(image_base64, phone_number)
+                # Analyze image with context and session management
+                diagnosis, crop_type = await analyze_crop_image(image_base64, user_id)
+                
+                # Save image upload to database (store base64 instead of message text)
+                save_message(
+                    user_id=user_id,
+                    message="",  # Empty message for image uploads
+                    image_base64=image_base64,
+                    is_bot=False,
+                    crop_type=crop_type
+                )
                 
                 # Format and send diagnosis in proper chunks
                 diagnosis_chunks = format_whatsapp_message(diagnosis, max_length=1500)
                 
                 for i, chunk in enumerate(diagnosis_chunks):
-                    save_message(phone_number, chunk, is_bot=True)
+                    # Save each diagnosis chunk to database
+                    save_message(
+                        user_id=user_id,
+                        message=chunk,
+                        is_bot=True,
+                        crop_type=crop_type
+                    )
                     
                     if len(diagnosis_chunks) > 1:
                         chunk_with_indicator = f"📋 Report ({i+1}/{len(diagnosis_chunks)})\n{chunk}"
@@ -445,14 +353,27 @@ async def webhook(req: Request):
                     "• 'दवा' or 'medicine'"
                 )
                 send_whatsapp_message(phone_number, follow_up_msg)
+                
+                # Save follow-up message to database
+                save_message(
+                    user_id=user_id,
+                    message=follow_up_msg,
+                    is_bot=True,
+                    crop_type=crop_type
+                )
 
             except Exception as e:
                 error_msg = f"❌ Photo processing mein problem: {str(e)[:100]}..."
                 print(f"Image processing error for {phone_number}: {str(e)}")
                 send_whatsapp_message(phone_number, error_msg)
                 
-                # Also save the error to database
-                save_message(phone_number, f"Error: {str(e)}", is_bot=True)
+                # Save error message to database
+                save_message(
+                    user_id=user_id,
+                    message=error_msg,
+                    is_bot=True,
+                    crop_type=""
+                )
 
         # If neither text nor image
         else:
@@ -469,6 +390,15 @@ async def webhook(req: Request):
                 "📍 Share your location"
             )
             send_whatsapp_message(phone_number, help_msg)
+            
+            # Save help message to database
+            save_user(user_id, phone_number, "")
+            save_message(
+                user_id=user_id,
+                message=help_msg,
+                is_bot=True,
+                crop_type=""
+            )
 
         return {"status": "success"}
 
@@ -476,27 +406,44 @@ async def webhook(req: Request):
         print(f"Webhook error: {str(e)}")
         return {"status": "error", "message": str(e)}
 
-# ---------------------------- USER CONTEXT ENDPOINT ----------------------------
+# ---------------------------- SESSION MANAGEMENT ENDPOINTS ----------------------------
 
-@router.get("/user-context/{user_id}")
-async def get_user_context(user_id: str):
-    """Get user's conversation context and history"""
-    try:
-        context = context_manager.get_user_context(user_id)
+@router.get("/session/{user_id}")
+async def get_session_info(user_id: str):
+    """Get session information for a specific user"""
+    session_info = get_user_session_info(user_id)
+    if session_info:
         return {
             "user_id": user_id,
-            "context": {
-                "crop_type": context.get('crop_type'),
-                "location": context.get('location'),
-                "identified_diseases": context.get('identified_diseases', []),
-                "conversation_count": len(context.get('conversation_history', [])) // 2,
-                "last_analysis": context.get('last_analysis', {}).get('timestamp') if context.get('last_analysis') else None
-            }
+            "session_info": session_info
         }
-    except Exception as e:
-        return {"error": f"Context retrieval error: {str(e)}"}
+    else:
+        return {
+            "user_id": user_id,
+            "session_info": None,
+            "message": "No active session found"
+        }
 
-# ---------------------------- DEBUGGING ENDPOINT ----------------------------
+@router.delete("/session/{user_id}")
+async def clear_session(user_id: str):
+    """Clear a user's session"""
+    success = clear_user_conversation(user_id)
+    return {
+        "user_id": user_id,
+        "cleared": success,
+        "message": "Session cleared" if success else "No active session to clear"
+    }
+
+@router.get("/sessions/stats")
+async def get_sessions_stats():
+    """Get statistics about all active sessions"""
+    stats = get_all_sessions_info()
+    return {
+        "active_sessions": get_active_sessions_count(),
+        "stats": stats
+    }
+
+# ---------------------------- DEBUGGING ENDPOINTS ----------------------------
 
 @router.get("/debug/credentials")
 async def debug_credentials():
@@ -514,24 +461,15 @@ async def debug_credentials():
         },
         "env_check": {
             "from_env_sid": os.getenv("TWILIO_ACCOUNT_SID", "NOT_FOUND")[:8] + "..." if os.getenv("TWILIO_ACCOUNT_SID") else "NOT_FOUND",
-            "from_env_token_length": len(os.getenv("TWILIO_AUTH_TOKEN", "")) if os.getenv("TWILIO_AUTH_TOKEN") else 0
+            "from_env_token_length": len(os.getenv("TWILIO_AUTH_TOKEN") or "") if os.getenv("TWILIO_AUTH_TOKEN") else 0
         }
     }
 
-# ---------------------------- HEALTH CHECK ENDPOINT ----------------------------
-
-@router.get("/health")
-async def health_check():
-    """API health check"""
+@router.get("/debug/sessions")
+async def debug_sessions():
+    """Debug endpoint to check session manager status"""
     return {
-        "status": "healthy",
-        "service": "Crop Disease AI Bot",
-        "version": "2.0.0",
-        "features": [
-            "Intelligent conversation context",
-            "Enhanced image analysis",
-            "Hindi-English mixed responses",
-            "Treatment follow-up",
-            "WhatsApp integration"
-        ]
+        "session_manager_status": "active",
+        "active_sessions": get_active_sessions_count(),
+        "all_sessions": get_all_sessions_info()
     }
