@@ -9,7 +9,8 @@ db = client["whatsapp_bot"]
 
 # Collections
 users_collection = db["users"]
-messages_collection = db["messages"]
+# Ensure the "messages" collection exists or is referenced correctly
+messages_collection = db.get_collection("messages")
 
 
 def save_user(user_id: str, phone_number: str = "", name: str = ""):
